@@ -2,8 +2,8 @@ import os
 import sqlite3
 import threading
 from contextlib import contextmanager
-from datetime import date
-from typing import Any, Dict, Generator, List, Optional
+from datetime import datetime
+from typing import Any, Dict, Generator, List, Optional, Tuple
 
 from .settings import get_settings
 
@@ -74,7 +74,12 @@ def init_db() -> None:
                     title TEXT NOT NULL,
                     description TEXT,
                     category_id INTEGER,
-                    due_date TEXT,
+                    priority INTEGER DEFAULT 2, -- 3/2/1 high/med/low
+                    estimated_minutes INTEGER DEFAULT 0,
+                    due_datetime TEXT, -- ISO 8601 including time
+                    status TEXT DEFAULT 'open', -- open, in_progress, done, canceled
+                    recurrence TEXT DEFAULT 'none', -- none/daily/weekly/monthly
+                    recurrence_end_date TEXT, -- ISO date
                     completed INTEGER DEFAULT 0,
                     created_at TEXT DEFAULT (datetime('now')),
                     updated_at TEXT DEFAULT (datetime('now')),
@@ -106,7 +111,9 @@ def init_db() -> None:
                     value TEXT
                 );
 
-                CREATE INDEX IF NOT EXISTS idx_tasks_due_date ON tasks(due_date);
+                CREATE INDEX IF NOT EXISTS idx_tasks_due_datetime ON tasks(due_datetime);
+                CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+                CREATE INDEX IF NOT EXISTS idx_tasks_priority ON tasks(priority);
                 CREATE INDEX IF NOT EXISTS idx_reminders_remind_at ON reminders(remind_at);
                 CREATE INDEX IF NOT EXISTS idx_reminders_sent ON reminders(sent);
                 """
@@ -124,39 +131,237 @@ def _get_or_create_category(cur: sqlite3.Cursor, name: Optional[str]) -> Optiona
     return int(row["id"]) if row else None
 
 
-def add_task(title: str, description: str = "", category_name: Optional[str] = None, due_date: Optional[date] = None) -> int:
-    """Insert a task and optional category."""
+def _upsert_initial_reminder(cur: sqlite3.Cursor, task_id: int, due_iso: Optional[str]) -> None:
+    """
+    Create or update a reminder aligned to the task's due datetime.
+    If due_iso is None, do nothing.
+    """
+    if not due_iso:
+        return
+    # If a reminder exists for this task and is not sent, update its remind_at, else insert
+    cur.execute("SELECT id, sent FROM reminders WHERE task_id = ? ORDER BY id ASC LIMIT 1", (task_id,))
+    existing = cur.fetchone()
+    if existing:
+        cur.execute("UPDATE reminders SET remind_at = ?, sent = 0 WHERE id = ?", (due_iso, int(existing["id"])))
+    else:
+        cur.execute(
+            "INSERT INTO reminders (task_id, remind_at, sent, created_at) VALUES (?, ?, 0, datetime('now'))",
+            (task_id, due_iso),
+        )
+
+
+# PUBLIC_INTERFACE
+def create_task(
+    title: str,
+    description: str = "",
+    category_name: Optional[str] = None,
+    priority: int = 2,
+    estimated_minutes: int = 0,
+    due_datetime: Optional[str] = None,  # ISO 8601 "YYYY-MM-DDTHH:MM"
+    status: str = "open",
+    recurrence: str = "none",  # none/daily/weekly/monthly
+    recurrence_end_date: Optional[str] = None,  # ISO date "YYYY-MM-DD"
+) -> int:
+    """Create a task with full attributes and create initial reminder for due_datetime."""
     if not title or not title.strip():
         raise ValueError("Task title is required.")
+    if estimated_minutes is not None and estimated_minutes < 0:
+        raise ValueError("Estimated minutes must be >= 0.")
+    if priority not in (1, 2, 3, 4, 5) and priority not in (1, 2, 3):
+        # Normalize priority to 1..3 scale if 5-point given
+        if isinstance(priority, int) and 1 <= priority <= 5:
+            priority = 3 if priority >= 4 else 2 if priority >= 2 else 1
+        else:
+            raise ValueError("Priority must be in {1,2,3} or 1..5 scale.")
+    # validate due_datetime if present
+    if due_datetime:
+        try:
+            datetime.fromisoformat(due_datetime)
+        except Exception:
+            raise ValueError("Invalid due date/time format. Use ISO 8601 e.g., 2025-01-31T14:30")
+    # validate recurrence_end_date
+    if recurrence_end_date:
+        try:
+            datetime.fromisoformat(recurrence_end_date)
+        except Exception:
+            raise ValueError("Invalid recurrence end date format. Use YYYY-MM-DD")
+    if recurrence not in ("none", "daily", "weekly", "monthly"):
+        raise ValueError("Invalid recurrence value.")
+    if status not in ("open", "in_progress", "done", "canceled"):
+        raise ValueError("Invalid status value.")
+
     with get_cursor() as cur:
         cat_id = _get_or_create_category(cur, category_name)
-        due_text = due_date.isoformat() if isinstance(due_date, date) else None
         cur.execute(
             """
-            INSERT INTO tasks (title, description, category_id, due_date, completed, created_at, updated_at)
-            VALUES (?, ?, ?, ?, 0, datetime('now'), datetime('now'))
+            INSERT INTO tasks (title, description, category_id, priority, estimated_minutes, due_datetime,
+                               status, recurrence, recurrence_end_date, completed, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CASE WHEN ? IN ('done') THEN 1 ELSE 0 END, datetime('now'), datetime('now'))
             """,
-            (title.strip(), description.strip() if description else "", cat_id, due_text),
+            (
+                title.strip(),
+                (description or "").strip(),
+                cat_id,
+                int(priority),
+                int(estimated_minutes or 0),
+                due_datetime,
+                status,
+                recurrence,
+                recurrence_end_date,
+                status,
+            ),
         )
-        return int(cur.lastrowid)
+        task_id = int(cur.lastrowid)
+        _upsert_initial_reminder(cur, task_id, due_datetime)
+        return task_id
 
 
-def list_tasks(limit: int = 50) -> List[Dict[str, Any]]:
-    """Return a list of tasks joined with category names."""
+# PUBLIC_INTERFACE
+def update_task(
+    task_id: int,
+    title: str,
+    description: str,
+    category_name: Optional[str],
+    priority: int,
+    estimated_minutes: int,
+    due_datetime: Optional[str],
+    status: str,
+    recurrence: str,
+    recurrence_end_date: Optional[str],
+) -> None:
+    """Update a task and its initial reminder aligned to due_datetime."""
+    if not title or not title.strip():
+        raise ValueError("Task title is required.")
+    if estimated_minutes is not None and estimated_minutes < 0:
+        raise ValueError("Estimated minutes must be >= 0.")
+    if due_datetime:
+        try:
+            datetime.fromisoformat(due_datetime)
+        except Exception:
+            raise ValueError("Invalid due date/time format.")
+    if recurrence_end_date:
+        try:
+            datetime.fromisoformat(recurrence_end_date)
+        except Exception:
+            raise ValueError("Invalid recurrence end date format.")
+    if recurrence not in ("none", "daily", "weekly", "monthly"):
+        raise ValueError("Invalid recurrence value.")
+    if status not in ("open", "in_progress", "done", "canceled"):
+        raise ValueError("Invalid status value.")
+
+    with get_cursor() as cur:
+        cat_id = _get_or_create_category(cur, category_name)
+        cur.execute(
+            """
+            UPDATE tasks
+            SET title = ?, description = ?, category_id = ?, priority = ?, estimated_minutes = ?,
+                due_datetime = ?, status = ?, recurrence = ?, recurrence_end_date = ?, 
+                completed = CASE WHEN ? IN ('done') THEN 1 ELSE 0 END,
+                updated_at = datetime('now')
+            WHERE id = ?
+            """,
+            (
+                title.strip(),
+                (description or "").strip(),
+                cat_id,
+                int(priority),
+                int(estimated_minutes or 0),
+                due_datetime,
+                status,
+                recurrence,
+                recurrence_end_date,
+                status,
+                int(task_id),
+            ),
+        )
+        _upsert_initial_reminder(cur, int(task_id), due_datetime)
+
+
+# PUBLIC_INTERFACE
+# PUBLIC_INTERFACE
+def delete_task(task_id: int) -> None:
+    """Delete a task (cascades to reminders)."""
+    with get_cursor() as cur:
+        cur.execute("DELETE FROM tasks WHERE id = ?", (int(task_id),))
+
+
+# PUBLIC_INTERFACE
+# PUBLIC_INTERFACE
+def get_task(task_id: int) -> Optional[Dict[str, Any]]:
+    """Return a single task with its category name."""
     with get_cursor() as cur:
         cur.execute(
             """
-            SELECT t.id, t.title, t.description, t.due_date, t.completed,
-                   COALESCE(c.name, '') as category
+            SELECT t.*, COALESCE(c.name,'') as category
             FROM tasks t
             LEFT JOIN categories c ON t.category_id = c.id
-            ORDER BY COALESCE(t.due_date, '9999-12-31') ASC, t.created_at DESC
-            LIMIT ?
+            WHERE t.id = ?
             """,
-            (limit,),
+            (int(task_id),),
         )
-        rows = cur.fetchall()
-        return [dict(row) for row in rows]
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+
+# PUBLIC_INTERFACE
+def list_tasks(
+    limit: int = 200,
+    status: Optional[str] = None,
+    category: Optional[str] = None,
+    priority_min: Optional[int] = None,
+    priority_max: Optional[int] = None,
+    date_range: Optional[Tuple[str, str]] = None,  # ("YYYY-MM-DD","YYYY-MM-DD")
+    search: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Return a list of tasks with filters and search."""
+    where = []
+    params: List[Any] = []
+    if status and status != "any":
+        where.append("t.status = ?")
+        params.append(status)
+    if category and category != "any":
+        where.append("c.name = ?")
+        params.append(category)
+    if priority_min is not None:
+        where.append("t.priority >= ?")
+        params.append(int(priority_min))
+    if priority_max is not None:
+        where.append("t.priority <= ?")
+        params.append(int(priority_max))
+    if date_range and date_range[0]:
+        where.append("date(t.due_datetime) >= date(?)")
+        params.append(date_range[0])
+    if date_range and len(date_range) > 1 and date_range[1]:
+        where.append("date(t.due_datetime) <= date(?)")
+        params.append(date_range[1])
+    if search and search.strip():
+        where.append("(t.title LIKE ? OR t.description LIKE ?)")
+        like = f"%{search.strip()}%"
+        params.extend([like, like])
+
+    sql = """
+        SELECT t.id, t.title, t.description, t.priority, t.estimated_minutes,
+               t.due_datetime, t.status, t.recurrence, t.recurrence_end_date,
+               t.completed, COALESCE(c.name,'') as category
+        FROM tasks t
+        LEFT JOIN categories c ON t.category_id = c.id
+    """
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY COALESCE(t.due_datetime, '9999-12-31T23:59') ASC, t.created_at DESC LIMIT ?"
+    params.append(int(limit))
+    with get_cursor() as cur:
+        cur.execute(sql, tuple(params))
+        return [dict(r) for r in cur.fetchall()]
+
+
+# PUBLIC_INTERFACE
+# PUBLIC_INTERFACE
+def list_categories() -> List[str]:
+    """Return distinct category names."""
+    with get_cursor() as cur:
+        cur.execute("SELECT name FROM categories ORDER BY name ASC")
+        return [r["name"] for r in cur.fetchall()]
 
 
 def count_open_tasks() -> int:
@@ -173,8 +378,8 @@ def count_due_today() -> int:
             SELECT COUNT(*) as cnt
             FROM tasks
             WHERE completed = 0
-              AND due_date IS NOT NULL
-              AND date(due_date) = date('now', 'localtime')
+              AND due_datetime IS NOT NULL
+              AND date(due_datetime) = date('now', 'localtime')
             """
         )
         row = cur.fetchone()

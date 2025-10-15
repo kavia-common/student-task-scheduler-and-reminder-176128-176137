@@ -1,9 +1,10 @@
 import streamlit as st
+from datetime import datetime
 
 from . import db
 from . import scheduler as sched
 from .settings import get_settings, Settings
-from .utils import ocean_styles, toast_info, toast_success
+from .utils import ocean_styles, toast_info, toast_success, toast_warning, format_ts
 
 
 # PUBLIC_INTERFACE
@@ -104,27 +105,163 @@ def page_dashboard() -> None:
 
 def page_tasks() -> None:
     st.markdown("### ✅ Tasks")
-    st.write("Create and manage tasks. (Placeholder UI)")
 
-    with st.expander("Add Task"):
-        title = st.text_input("Title", "")
-        description = st.text_area("Description", "")
-        category = st.text_input("Category", "")
-        due_date = st.date_input("Due Date (optional)")
-        if st.button("Add Task"):
+    # Filters
+    with st.container():
+        colf1, colf2, colf3, colf4, colf5 = st.columns([1.3,1,1,1.6,1.3])
+        with colf1:
+            status = st.selectbox("Status", options=["any","open","in_progress","done","canceled"], index=0)
+        with colf2:
+            categories = ["any"] + db.list_categories()
+            category = st.selectbox("Category", options=categories, index=0)
+        with colf3:
+            priority_min = st.select_slider("Min Priority", options=[1,2,3], value=1, help="1=Low, 2=Med, 3=High")
+        with colf4:
+            date_range = st.date_input("Due date range", [])
+        with colf5:
+            search = st.text_input("Search", "")
+
+    # Create/Edit form
+    st.markdown("#### Add / Edit Task")
+    if "edit_task_id" not in st.session_state:
+        st.session_state["edit_task_id"] = None
+
+    editing = st.session_state["edit_task_id"] is not None
+    existing = db.get_task(st.session_state["edit_task_id"]) if editing else None
+
+    with st.form("task_form", clear_on_submit=not editing):
+        col1, col2 = st.columns(2)
+        with col1:
+            title = st.text_input("Title*", value=(existing["title"] if existing else ""))
+            category_name = st.text_input("Category", value=(existing["category"] if existing else ""))
+            priority_label_to_val = {"High":3, "Medium":2, "Low":1}
+            inv_map = {1:"Low",2:"Medium",3:"High"}
+            priority_init = inv_map.get(int(existing["priority"])) if existing and existing.get("priority") is not None else "Medium"
+            priority_label = st.selectbox("Priority", options=["High","Medium","Low"], index=["High","Medium","Low"].index(priority_init))
+            est = st.number_input("Estimated minutes", min_value=0, step=5, value=int(existing["estimated_minutes"]) if existing and existing.get("estimated_minutes") is not None else 0)
+        with col2:
+            status_val = st.selectbox("Status", options=["open","in_progress","done","canceled"], index=(["open","in_progress","done","canceled"].index(existing["status"]) if existing else 0))
+            recurrence = st.selectbox("Recurrence", options=["none","daily","weekly","monthly"], index=(["none","daily","weekly","monthly"].index(existing["recurrence"]) if existing else 0))
+            rec_end = st.date_input("Recurrence end date", value=(None if not existing or not existing.get("recurrence_end_date") else datetime.fromisoformat(existing["recurrence_end_date"])))  # type: ignore
+        description = st.text_area("Description", value=(existing["description"] if existing else ""))
+
+        # Due date and time
+        coldt1, coldt2 = st.columns(2)
+        if existing and existing.get("due_datetime"):
             try:
-                db.add_task(title=title, description=description, category_name=category, due_date=due_date)
-                toast_success("Task added.")
-            except Exception as ex:
-                st.error(f"Failed to add task: {ex}")
+                eddt = datetime.fromisoformat(existing["due_datetime"])
+                due_date = st.date_input("Due date", value=eddt.date())
+                due_time = st.time_input("Due time", value=eddt.time().replace(second=0, microsecond=0))
+            except Exception:
+                due_date = st.date_input("Due date", value=None)
+                due_time = st.time_input("Due time", value=None)
+        else:
+            due_date = st.date_input("Due date", value=None)
+            due_time = st.time_input("Due time", value=None)
 
-    st.markdown("#### Tasks")
-    tasks = db.list_tasks(limit=20)
+        submitted = st.form_submit_button("Update Task" if editing else "Create Task")
+        if submitted:
+            # validation
+            if not title or not title.strip():
+                toast_warning("Title is required.")
+            elif est is not None and est < 0:
+                toast_warning("Estimated minutes must be >= 0.")
+            else:
+                due_iso = None
+                if due_date and due_time:
+                    due_iso = datetime.combine(due_date, due_time).isoformat(timespec="minutes")
+                elif due_date and not due_time:
+                    # default time 09:00
+                    due_iso = datetime.combine(due_date, datetime.strptime("09:00", "%H:%M").time()).isoformat(timespec="minutes")
+
+                rec_end_iso = rec_end.isoformat() if rec_end else None
+                try:
+                    if editing and existing:
+                        db.update_task(
+                            task_id=int(existing["id"]),
+                            title=title,
+                            description=description,
+                            category_name=category_name,
+                            priority=int(priority_label_to_val[priority_label]),
+                            estimated_minutes=int(est or 0),
+                            due_datetime=due_iso,
+                            status=status_val,
+                            recurrence=recurrence,
+                            recurrence_end_date=rec_end_iso,
+                        )
+                        st.session_state["edit_task_id"] = None
+                        toast_success("Task updated.")
+                    else:
+                        db.create_task(
+                            title=title,
+                            description=description,
+                            category_name=category_name,
+                            priority=int(priority_label_to_val[priority_label]),
+                            estimated_minutes=int(est or 0),
+                            due_datetime=due_iso,
+                            status=status_val,
+                            recurrence=recurrence,
+                            recurrence_end_date=rec_end_iso,
+                        )
+                        toast_success("Task created.")
+                except Exception as ex:
+                    st.error(f"Failed to save task: {ex}")
+
+    st.markdown("#### Task List")
+    # prepare date_range tuple
+    dr_tuple = None
+    if isinstance(date_range, list) and len(date_range) == 2:
+        start = date_range[0].isoformat() if date_range[0] else None
+        end = date_range[1].isoformat() if date_range[1] else None
+        if start or end:
+            dr_tuple = (start or "", end or "")
+    elif not date_range:
+        dr_tuple = None
+
+    tasks = db.list_tasks(
+        limit=500,
+        status=status,
+        category=category,
+        priority_min=priority_min,
+        priority_max=3,
+        date_range=dr_tuple,
+        search=search,
+    )
+
     if not tasks:
-        st.caption("No tasks yet.")
+        st.caption("No tasks found.")
     else:
         for t in tasks:
-            st.write(f"- [{ 'x' if t['completed'] else ' '}] {t['title']} (Category: {t.get('category','-')})")
+            with st.container():
+                cols = st.columns([0.05, 0.35, 0.2, 0.2, 0.2])
+                with cols[0]:
+                    st.write("✅" if t.get("completed") else "⬜")
+                with cols[1]:
+                    st.write(f"{t['title']}  \n{t.get('description','')}")
+                    meta = []
+                    if t.get("category"):
+                        meta.append(f"📁 {t['category']}")
+                    meta.append(f"🔼 P{int(t.get('priority') or 0)}")
+                    if t.get("estimated_minutes") is not None:
+                        meta.append(f"⏱️ {int(t['estimated_minutes'])}m")
+                    if t.get("due_datetime"):
+                        meta.append(f"🕒 {format_ts(t['due_datetime'])}")
+                    st.caption(" • ".join(meta))
+                with cols[2]:
+                    st.caption(f"Status: {t.get('status')}")
+                    st.caption(f"Recurrence: {t.get('recurrence')}")
+                with cols[3]:
+                    if st.button("Edit", key=f"edit_{t['id']}"):
+                        st.session_state["edit_task_id"] = int(t["id"])
+                        st.experimental_rerun()
+                with cols[4]:
+                    if st.button("Delete", type="primary", key=f"del_{t['id']}"):
+                        try:
+                            db.delete_task(int(t["id"]))
+                            toast_success("Task deleted.")
+                            st.experimental_rerun()
+                        except Exception as ex:
+                            st.error(f"Failed to delete: {ex}")
 
 
 def page_pomodoro() -> None:
