@@ -16,6 +16,7 @@ from .dashboards import (
     tasks_by_category_dataframe,
     priority_distribution_dataframe,
 )
+from .suggestion import get_top_suggestions
 
 
 # PUBLIC_INTERFACE
@@ -151,6 +152,75 @@ def page_dashboard() -> None:
     with c3:
         st.metric("Pomodoro Sessions Today", db.count_pomodoro_today())
 
+    # Suggestions panel
+    st.markdown("#### 🔮 Suggestions")
+    sc1, sc2 = st.columns([2, 1])
+    with sc2:
+        slot = st.number_input("Available minutes (optional)", min_value=0, value=0, step=5,
+                               help="If you have a time slot now, we can bias toward short tasks.")
+        effective_slot = int(slot) if int(slot) > 0 else None
+    with sc1:
+        suggestions = get_top_suggestions(limit=3, for_minutes=effective_slot)
+        if not suggestions:
+            st.caption("No suggestions yet. Create some tasks to get started.")
+        else:
+            for s in suggestions:
+                with st.container():
+                    cols = st.columns([0.55, 0.15, 0.15, 0.15])
+                    with cols[0]:
+                        st.write(f"#{s['id']} • {s['title']}")
+                        meta = []
+                        if s.get("category"):
+                            meta.append(f"📁 {s['category']}")
+                        meta.append(f"🔼 P{int(s.get('priority') or 0)}")
+                        if s.get("estimated_minutes") is not None:
+                            meta.append(f"⏱️ {int(s.get('estimated_minutes') or 0)}m")
+                        if s.get("due_datetime"):
+                            meta.append(f"🕒 {format_ts(s['due_datetime'])}")
+                        meta.append(f"💡 score: {s['score']}")
+                        st.caption(" • ".join(meta))
+
+                        # Reasoning factors
+                        f = s.get("factors", {})
+                        reason_bits = []
+                        if f.get("overdue"):
+                            reason_bits.append("overdue boost")
+                        reason_bits.append(f"priority={f.get('priority_norm',0)}")
+                        reason_bits.append(f"urgency={f.get('urgency',0)}")
+                        if f.get("short_task_bonus", 0) > 0:
+                            reason_bits.append(f"short+{f.get('short_task_bonus')}")
+                        if "slot_penalty" in f:
+                            reason_bits.append(f"-penalty {f.get('slot_penalty')}")
+                        st.caption("Factors: " + ", ".join([str(x) for x in reason_bits if x]))
+                    with cols[1]:
+                        st.caption(f"Status: {s.get('status')}")
+                    with cols[2]:
+                        # Start now sets status to in_progress, and optionally starts pomodoro bound to this task
+                        if st.button("Start now", key=f"start_now_{s['id']}", type="primary"):
+                            try:
+                                existing = db.get_task(int(s["id"]))
+                                if existing:
+                                    db.update_task(
+                                        task_id=int(existing["id"]),
+                                        title=existing["title"],
+                                        description=existing.get("description") or "",
+                                        category_name=existing.get("category") or None,
+                                        priority=int(existing.get("priority") or 2),
+                                        estimated_minutes=int(existing.get("estimated_minutes") or 0),
+                                        due_datetime=existing.get("due_datetime"),
+                                        status="in_progress",
+                                        recurrence=existing.get("recurrence") or "none",
+                                        recurrence_end_date=existing.get("recurrence_end_date"),
+                                    )
+                                    toast_success("Task set to in_progress.")
+                                    # Optionally auto-bind to Pomodoro if user has a slot or config later
+                                    # from . import pomodoro as pomo  # lazy import in Tasks page block below to avoid overhead
+                                    st.experimental_rerun()
+                            except Exception as ex:
+                                st.error(f"Failed to start task: {ex}")
+                    with cols[3]:
+                        st.caption("")  # spacer
+
     st.markdown("---")
 
     # Charts
@@ -218,6 +288,76 @@ def page_dashboard() -> None:
 
 def page_tasks() -> None:
     st.markdown("### ✅ Tasks")
+
+    # Suggestions header and controls
+    with st.container():
+        s1, s2, s3 = st.columns([1.2, 1.2, 2])
+        with s1:
+            sug_slot = st.number_input("Available minutes (suggestions)", min_value=0, value=0, step=5)
+            eff_slot = int(sug_slot) if int(sug_slot) > 0 else None
+        with s2:
+            st.caption("Top 3 next-task suggestions below.")
+        with s3:
+            suggestions = get_top_suggestions(limit=3, for_minutes=eff_slot)
+            if not suggestions:
+                st.caption("No suggestions yet.")
+            else:
+                for s in suggestions:
+                    cols = st.columns([0.55, 0.2, 0.15, 0.1])
+                    with cols[0]:
+                        st.write(f"#{s['id']} • {s['title']}")
+                        meta = []
+                        if s.get("category"):
+                            meta.append(f"📁 {s['category']}")
+                        meta.append(f"🔼 P{int(s.get('priority') or 0)}")
+                        if s.get("estimated_minutes") is not None:
+                            meta.append(f"⏱️ {int(s.get('estimated_minutes') or 0)}m")
+                        if s.get("due_datetime"):
+                            meta.append(f"🕒 {format_ts(s['due_datetime'])}")
+                        meta.append(f"💡 {s['score']}")
+                        st.caption(" • ".join(meta))
+                    with cols[1]:
+                        f = s.get("factors", {})
+                        reason_bits = []
+                        if f.get("overdue"):
+                            reason_bits.append("overdue")
+                        reason_bits.append(f"pri={f.get('priority_norm',0)}")
+                        reason_bits.append(f"urg={f.get('urgency',0)}")
+                        if f.get("short_task_bonus", 0) > 0:
+                            reason_bits.append(f"short+{f.get('short_task_bonus')}")
+                        if "slot_penalty" in f:
+                            reason_bits.append(f"-{f.get('slot_penalty')}")
+                        st.caption(", ".join([str(x) for x in reason_bits if x]))
+                    with cols[2]:
+                        if st.button("Start now", key=f"tasks_start_now_{s['id']}", type="primary"):
+                            try:
+                                existing = db.get_task(int(s["id"]))
+                                if existing:
+                                    db.update_task(
+                                        task_id=int(existing["id"]),
+                                        title=existing["title"],
+                                        description=existing.get("description") or "",
+                                        category_name=existing.get("category") or None,
+                                        priority=int(existing.get("priority") or 2),
+                                        estimated_minutes=int(existing.get("estimated_minutes") or 0),
+                                        due_datetime=existing.get("due_datetime"),
+                                        status="in_progress",
+                                        recurrence=existing.get("recurrence") or "none",
+                                        recurrence_end_date=existing.get("recurrence_end_date"),
+                                    )
+                                    # Optional: start a Pomodoro bound to this task if the user wants quick start
+                                    try:
+                                        from . import pomodoro as pomo
+                                        pomo.start_ticker_once()
+                                        pomo.start_timer(bound_task_id=int(existing["id"]))
+                                    except Exception:
+                                        pass
+                                    toast_success("Started task and Pomodoro.")
+                                    st.experimental_rerun()
+                            except Exception as ex:
+                                st.error(f"Failed to start task: {ex}")
+                    with cols[3]:
+                        st.caption(f"#{s['id']}")
 
     # Filters
     with st.container():
@@ -368,7 +508,28 @@ def page_tasks() -> None:
                         st.session_state["edit_task_id"] = int(t["id"])
                         st.experimental_rerun()
                 with cols[4]:
-                    if st.button("Delete", type="primary", key=f"del_{t['id']}"):
+                    # two stacked buttons: Start now and Delete
+                    if st.button("Start now", key=f"start_row_{t['id']}", type="primary"):
+                        try:
+                            existing = db.get_task(int(t["id"]))
+                            if existing:
+                                db.update_task(
+                                    task_id=int(existing["id"]),
+                                    title=existing["title"],
+                                    description=existing.get("description") or "",
+                                    category_name=existing.get("category") or None,
+                                    priority=int(existing.get("priority") or 2),
+                                    estimated_minutes=int(existing.get("estimated_minutes") or 0),
+                                    due_datetime=existing.get("due_datetime"),
+                                    status="in_progress",
+                                    recurrence=existing.get("recurrence") or "none",
+                                    recurrence_end_date=existing.get("recurrence_end_date"),
+                                )
+                                toast_success("Task set to in_progress.")
+                                st.experimental_rerun()
+                        except Exception as ex:
+                            st.error(f"Failed to start: {ex}")
+                    if st.button("Delete", key=f"del_{t['id']}"):
                         try:
                             db.delete_task(int(t["id"]))
                             toast_success("Task deleted.")
@@ -511,6 +672,22 @@ def page_settings(settings: Settings) -> None:
     st.text_input("Database Path", value=db.get_db_path(), disabled=True, help="Using local SQLite database.")
     st.toggle("Notifications Enabled", value=settings.NOTIFICATIONS_ENABLED, disabled=True)
     st.slider("Scheduler Interval Seconds", 15, 300, settings.SCHEDULER_INTERVAL_SECONDS, disabled=True)
+
+    st.markdown("#### Suggestion Weights (read-only; configure via env)")
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.number_input("Weight: Priority", value=float(settings.SUGGESTION_WEIGHT_PRIORITY), disabled=True)
+    with c2:
+        st.number_input("Weight: Urgency", value=float(settings.SUGGESTION_WEIGHT_URGENCY), disabled=True)
+    with c3:
+        st.number_input("Weight: Overdue", value=float(settings.SUGGESTION_WEIGHT_OVERDUE_BOOST), disabled=True)
+    with c4:
+        st.number_input("Weight: Short-task", value=float(settings.SUGGESTION_WEIGHT_SHORT_TASK_BIAS), disabled=True)
+    c5, c6 = st.columns(2)
+    with c5:
+        st.number_input("Short-task threshold (min)", value=int(settings.SUGGESTION_SHORT_TASK_THRESHOLD_MIN), disabled=True)
+    with c6:
+        st.number_input("Urgency window (hours)", value=int(settings.SUGGESTION_URGENCY_WINDOW_HOURS), disabled=True)
 
     st.caption("Environment variables can override defaults. See .env.example.")
 

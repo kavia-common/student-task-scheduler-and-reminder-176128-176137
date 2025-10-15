@@ -10,6 +10,14 @@ class Settings:
     NOTIFICATIONS_ENABLED: bool = True
     SCHEDULER_INTERVAL_SECONDS: int = 60
 
+    # Suggestion engine weights (configurable)
+    SUGGESTION_WEIGHT_PRIORITY: float = 1.0
+    SUGGESTION_WEIGHT_URGENCY: float = 1.0
+    SUGGESTION_WEIGHT_OVERDUE_BOOST: float = 1.0
+    SUGGESTION_WEIGHT_SHORT_TASK_BIAS: float = 0.5
+    SUGGESTION_SHORT_TASK_THRESHOLD_MIN: int = 30
+    SUGGESTION_URGENCY_WINDOW_HOURS: int = 72
+
     # Theme colors (for potential future use beyond utils.ocean_styles)
     THEME_PRIMARY: str = "#2563EB"
     THEME_SECONDARY: str = "#F59E0B"
@@ -35,9 +43,27 @@ def get_settings() -> Settings:
     except ValueError:
         interval = 60
 
+    def _get_float(name: str, default: float) -> float:
+        try:
+            return float(os.getenv(name, str(default)))
+        except Exception:
+            return default
+
+    def _get_int(name: str, default: int) -> int:
+        try:
+            return int(os.getenv(name, str(default)))
+        except Exception:
+            return default
+
     _settings_singleton = Settings(
         DATA_DIR=data_dir,
         NOTIFICATIONS_ENABLED=notif,
         SCHEDULER_INTERVAL_SECONDS=interval,
+        SUGGESTION_WEIGHT_PRIORITY=_get_float("SUGGESTION_WEIGHT_PRIORITY", 1.0),
+        SUGGESTION_WEIGHT_URGENCY=_get_float("SUGGESTION_WEIGHT_URGENCY", 1.0),
+        SUGGESTION_WEIGHT_OVERDUE_BOOST=_get_float("SUGGESTION_WEIGHT_OVERDUE_BOOST", 1.0),
+        SUGGESTION_WEIGHT_SHORT_TASK_BIAS=_get_float("SUGGESTION_WEIGHT_SHORT_TASK_BIAS", 0.5),
+        SUGGESTION_SHORT_TASK_THRESHOLD_MIN=_get_int("SUGGESTION_SHORT_TASK_THRESHOLD_MIN", 30),
+        SUGGESTION_URGENCY_WINDOW_HOURS=_get_int("SUGGESTION_URGENCY_WINDOW_HOURS", 72),
     )
     return _settings_singleton
