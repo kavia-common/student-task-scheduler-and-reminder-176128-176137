@@ -379,8 +379,129 @@ def page_tasks() -> None:
 
 def page_pomodoro() -> None:
     st.markdown("### 🍅 Pomodoro")
-    st.write("Focus timer and session logging. (Placeholder UI)")
-    st.caption("Use this page to start a focus session and log results. Coming soon.")
+    from . import pomodoro as pomo
+
+    # Ensure ticker is running (single per process)
+    pomo.start_ticker_once()
+
+    # Load config/state
+    cfg, state = pomo.get_config_and_state()
+
+    # Config panel
+    with st.container():
+        st.subheader("Configuration")
+        c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
+        with c1:
+            focus = st.number_input("Focus (min)", min_value=1, max_value=180, value=int(cfg.focus_minutes), step=1,
+                                    help="Duration of focus interval.")
+        with c2:
+            short = st.number_input("Short Break (min)", min_value=1, max_value=60, value=int(cfg.short_break_minutes), step=1)
+        with c3:
+            long = st.number_input("Long Break (min)", min_value=1, max_value=120, value=int(cfg.long_break_minutes), step=1)
+        with c4:
+            interval = st.number_input("Long Break Interval", min_value=1, max_value=12, value=int(cfg.long_break_interval), step=1,
+                                       help="Take a long break after this many focus sessions.")
+        if st.button("Apply", key="apply_pomo_cfg"):
+            try:
+                pomo.apply_config(int(focus), int(short), int(long), int(interval))
+                st.success("Pomodoro configuration updated.")
+            except Exception as ex:
+                st.error(f"Failed to update: {ex}")
+
+    st.markdown("---")
+
+    # Bind to task
+    with st.container():
+        st.subheader("Bind to Task")
+        tasks = db.list_tasks(limit=200, status="any", category="any", priority_min=None, priority_max=None, date_range=None, search=None)
+        task_options = ["(None)"] + [f"#{t['id']} • {t['title']}" for t in tasks]
+        current_idx = 0
+        if state.bound_task_id:
+            for i, t in enumerate(tasks, start=1):
+                if int(t["id"]) == int(state.bound_task_id):
+                    current_idx = i
+                    break
+        sel = st.selectbox("Attach sessions to task", options=task_options, index=current_idx)
+        bound_task_id = None
+        if sel != "(None)":
+            try:
+                bound_task_id = int(sel.split("•")[0].strip().replace("#", ""))
+            except Exception:
+                bound_task_id = None
+
+    # Timer display and controls
+    with st.container():
+        st.subheader("Timer")
+        tcol1, tcol2, tcol3 = st.columns([2, 1, 1])
+        with tcol1:
+            st.markdown(f"Mode: {' '.join([w.capitalize() for w in state.mode.split('_')])}")
+            time_str = pomo.format_time_left(max(0, int(state.time_left_sec)))
+            st.markdown(f"<h1 style='color:#111827'>{time_str}</h1>", unsafe_allow_html=True)
+
+            # Progress bar
+            total_len = {
+                "focus": cfg.focus_minutes * 60,
+                "short_break": cfg.short_break_minutes * 60,
+                "long_break": cfg.long_break_minutes * 60,
+            }[state.mode]
+            progress = (total_len - state.time_left_sec) / max(1, total_len)
+            st.progress(min(1.0, max(0.0, progress)))
+            st.caption(f"Cycle: {state.cycle_count % max(1, cfg.long_break_interval)} / {cfg.long_break_interval} "
+                       f"(focus sessions in this set)")
+
+        with tcol2:
+            if not state.is_running:
+                if st.button("Start", type="primary", use_container_width=True, key="pomo_start"):
+                    pomo.start_timer(bound_task_id)
+                    st.experimental_rerun()
+            else:
+                if st.button("Pause", use_container_width=True, key="pomo_pause"):
+                    pomo.pause_timer()
+                    st.experimental_rerun()
+            if st.button("Reset", use_container_width=True, key="pomo_reset"):
+                pomo.reset_timer()
+                st.experimental_rerun()
+
+        with tcol3:
+            st.caption("Quick Mode Switch")
+            if st.button("Focus", use_container_width=True, key="pomo_sw_focus"):
+                pomo.switch_mode("focus")
+                st.experimental_rerun()
+            if st.button("Short Break", use_container_width=True, key="pomo_sw_short"):
+                pomo.switch_mode("short_break")
+                st.experimental_rerun()
+            if st.button("Long Break", use_container_width=True, key="pomo_sw_long"):
+                pomo.switch_mode("long_break")
+                st.experimental_rerun()
+
+    st.markdown("---")
+
+    # History
+    with st.container():
+        st.subheader("Recent Sessions")
+        history = pomo.list_recent_sessions(limit=25)
+        if not history:
+            st.caption("No sessions yet. Start your first Pomodoro!")
+        else:
+            for row in history:
+                title = row.get("task_title") or "(No task)"
+                started = row.get("started_at")
+                ended = row.get("ended_at")
+                dur = row.get("duration_minutes")
+                notes = row.get("notes") or ""
+                with st.container():
+                    cols = st.columns([0.5, 1.5, 1, 2])
+                    with cols[0]:
+                        st.caption(f"#{row.get('id')}")
+                    with cols[1]:
+                        st.write(title)
+                        st.caption(f"⏱️ {int(dur)} min")
+                    with cols[2]:
+                        st.caption(f"Start: {started}")
+                        st.caption(f"End: {ended}")
+                    with cols[3]:
+                        if notes:
+                            st.caption(notes)
 
 
 def page_settings(settings: Settings) -> None:
