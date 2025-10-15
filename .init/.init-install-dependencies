@@ -1,0 +1,4 @@
+{
+    "command": "source venv/bin/activate && pip install -r requirements.txt",
+    "working_directory": "/home/kavia/workspace/code-generation/student-task-scheduler-and-reminder-176128-176137/task_scheduler_backend"
+}
