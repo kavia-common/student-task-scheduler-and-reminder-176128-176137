@@ -48,7 +48,12 @@ def _loop() -> None:
 
 # PUBLIC_INTERFACE
 def start_scheduler_once(interval_seconds: int = 60, notifications_enabled: bool = True) -> None:
-    """Start the scheduler loop in a daemon thread once per process."""
+    """Start the scheduler loop in a daemon thread once per process.
+
+    Parameters:
+    - interval_seconds: how often to scan for due reminders.
+    - notifications_enabled: whether to fire notifications for due reminders.
+    """
     global _scheduler_thread, _interval_seconds, _notifications_enabled
     with _scheduler_lock:
         if _scheduler_thread and _scheduler_thread.is_alive():

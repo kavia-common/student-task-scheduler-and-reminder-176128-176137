@@ -12,6 +12,7 @@ Quick start (Streamlit UI):
 
 2) Optional: copy .env.example to .env in task_scheduler_backend and adjust.
    - cp task_scheduler_backend/.env.example task_scheduler_backend/.env
+   - Edit .env to set data directory, scheduler interval, notification toggle, suggestion weights, and Pomodoro defaults.
 
 3) Run Streamlit:
    - cd task_scheduler_backend

@@ -47,7 +47,21 @@ def _now() -> datetime:
 def _ensure_session_state(config: Optional[PomodoroConfig] = None) -> Tuple[PomodoroConfig, PomodoroState]:
     """Create default config/state in st.session_state if absent."""
     if "pomodoro_config" not in st.session_state:
-        st.session_state["pomodoro_config"] = PomodoroConfig()
+        # Allow environment defaults at first init
+        import os
+        try:
+            focus = int(os.getenv("POMODORO_FOCUS_MINUTES", "25"))
+            short = int(os.getenv("POMODORO_SHORT_BREAK_MINUTES", "5"))
+            longb = int(os.getenv("POMODORO_LONG_BREAK_MINUTES", "15"))
+            interval = int(os.getenv("POMODORO_LONG_BREAK_INTERVAL", "4"))
+        except Exception:
+            focus, short, longb, interval = 25, 5, 15, 4
+        st.session_state["pomodoro_config"] = PomodoroConfig(
+            focus_minutes=max(1, focus),
+            short_break_minutes=max(1, short),
+            long_break_minutes=max(1, longb),
+            long_break_interval=max(1, interval),
+        )
     if "pomodoro_state" not in st.session_state:
         cfg: PomodoroConfig = st.session_state["pomodoro_config"]
         st.session_state["pomodoro_state"] = PomodoroState(

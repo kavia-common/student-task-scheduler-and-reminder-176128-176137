@@ -8,7 +8,14 @@ import plotly.express as px
 from . import db
 from . import scheduler as sched
 from .settings import get_settings, Settings
-from .utils import ocean_styles, toast_info, toast_success, toast_warning, format_ts
+from .utils import (
+    ocean_styles,
+    toast_info,
+    toast_success,
+    toast_warning,
+    format_ts,
+    confirm_action,
+)
 from .dashboards import (
     DashboardFilters,
     get_kpis,
@@ -61,6 +68,7 @@ def render_sidebar(settings: Settings) -> None:
             "Navigate",
             options=["Dashboard", "Tasks", "Pomodoro", "Settings"],
             index=["Dashboard", "Tasks", "Pomodoro", "Settings"].index(st.session_state["nav"]),
+            help="Use Up/Down arrows to change section. Press Enter to select.",
         )
         st.session_state["nav"] = nav
 
@@ -72,7 +80,7 @@ def render_sidebar(settings: Settings) -> None:
         notif = st.toggle(
             "Enable Notifications",
             value=settings.NOTIFICATIONS_ENABLED,
-            help="Turn reminder notifications on/off. Placeholders shown in UI.",
+            help="Turn reminder notifications on/off. OS notifications fallback to in-app toasts.",
         )
         interval = st.slider(
             "Scheduler Interval (seconds)",
@@ -385,17 +393,52 @@ def page_tasks() -> None:
     with st.form("task_form", clear_on_submit=not editing):
         col1, col2 = st.columns(2)
         with col1:
-            title = st.text_input("Title*", value=(existing["title"] if existing else ""))
-            category_name = st.text_input("Category", value=(existing["category"] if existing else ""))
-            priority_label_to_val = {"High":3, "Medium":2, "Low":1}
-            inv_map = {1:"Low",2:"Medium",3:"High"}
+            title = st.text_input(
+                "Title*",
+                value=(existing["title"] if existing else ""),
+                help="A short, action-oriented task title.",
+            )
+            category_name = st.text_input(
+                "Category",
+                value=(existing["category"] if existing else ""),
+                help="Optional. Examples: Study, Coding, Fitness.",
+            )
+            priority_label_to_val = {"High": 3, "Medium": 2, "Low": 1}
+            inv_map = {1: "Low", 2: "Medium", 3: "High"}
             priority_init = inv_map.get(int(existing["priority"])) if existing and existing.get("priority") is not None else "Medium"
-            priority_label = st.selectbox("Priority", options=["High","Medium","Low"], index=["High","Medium","Low"].index(priority_init))
-            est = st.number_input("Estimated minutes", min_value=0, step=5, value=int(existing["estimated_minutes"]) if existing and existing.get("estimated_minutes") is not None else 0)
+            priority_label = st.selectbox(
+                "Priority",
+                options=["High", "Medium", "Low"],
+                index=["High", "Medium", "Low"].index(priority_init),
+                help="High = urgent/important, Low = can wait.",
+            )
+            est = st.number_input(
+                "Estimated minutes",
+                min_value=0,
+                step=5,
+                value=int(existing["estimated_minutes"]) if existing and existing.get("estimated_minutes") is not None else 0,
+                help="Helps the suggestion engine recommend tasks for your available time.",
+            )
         with col2:
-            status_val = st.selectbox("Status", options=["open","in_progress","done","canceled"], index=(["open","in_progress","done","canceled"].index(existing["status"]) if existing else 0))
-            recurrence = st.selectbox("Recurrence", options=["none","daily","weekly","monthly"], index=(["none","daily","weekly","monthly"].index(existing["recurrence"]) if existing else 0))
-            rec_end = st.date_input("Recurrence end date", value=(None if not existing or not existing.get("recurrence_end_date") else datetime.fromisoformat(existing["recurrence_end_date"])))  # type: ignore
+            status_val = st.selectbox(
+                "Status",
+                options=["open", "in_progress", "done", "canceled"],
+                index=(["open", "in_progress", "done", "canceled"].index(existing["status"]) if existing else 0),
+            )
+            recurrence = st.selectbox(
+                "Recurrence",
+                options=["none", "daily", "weekly", "monthly"],
+                index=(["none", "daily", "weekly", "monthly"].index(existing["recurrence"]) if existing else 0),
+                help="For repeating tasks, choose a pattern.",
+            )
+            # Recurrence end date
+            rec_end_default = None
+            if existing and existing.get("recurrence_end_date"):
+                try:
+                    rec_end_default = datetime.fromisoformat(existing["recurrence_end_date"]).date()
+                except Exception:
+                    rec_end_default = None
+            rec_end = st.date_input("Recurrence end date", value=rec_end_default)
         description = st.text_area("Description", value=(existing["description"] if existing else ""))
 
         # Due date and time
@@ -419,6 +462,8 @@ def page_tasks() -> None:
                 toast_warning("Title is required.")
             elif est is not None and est < 0:
                 toast_warning("Estimated minutes must be >= 0.")
+            elif recurrence != "none" and not rec_end:
+                toast_warning("Please set a recurrence end date for repeating tasks.")
             else:
                 due_iso = None
                 if due_date and due_time:
@@ -428,13 +473,15 @@ def page_tasks() -> None:
                     due_iso = datetime.combine(due_date, datetime.strptime("09:00", "%H:%M").time()).isoformat(timespec="minutes")
 
                 rec_end_iso = rec_end.isoformat() if rec_end else None
+                # Sanitize category to None if blank
+                cat_name = (category_name or "").strip() or None
                 try:
                     if editing and existing:
                         db.update_task(
                             task_id=int(existing["id"]),
-                            title=title,
-                            description=description,
-                            category_name=category_name,
+                            title=title.strip(),
+                            description=(description or "").strip(),
+                            category_name=cat_name,
                             priority=int(priority_label_to_val[priority_label]),
                             estimated_minutes=int(est or 0),
                             due_datetime=due_iso,
@@ -446,9 +493,9 @@ def page_tasks() -> None:
                         toast_success("Task updated.")
                     else:
                         db.create_task(
-                            title=title,
-                            description=description,
-                            category_name=category_name,
+                            title=title.strip(),
+                            description=(description or "").strip(),
+                            category_name=cat_name,
                             priority=int(priority_label_to_val[priority_label]),
                             estimated_minutes=int(est or 0),
                             due_datetime=due_iso,
@@ -530,12 +577,14 @@ def page_tasks() -> None:
                         except Exception as ex:
                             st.error(f"Failed to start: {ex}")
                     if st.button("Delete", key=f"del_{t['id']}"):
-                        try:
-                            db.delete_task(int(t["id"]))
-                            toast_success("Task deleted.")
-                            st.experimental_rerun()
-                        except Exception as ex:
-                            st.error(f"Failed to delete: {ex}")
+                        # Ask for confirmation to avoid accidental deletions
+                        if confirm_action(key=f"confirm_del_{t['id']}", prompt=f"Confirm delete task #{t['id']}? This action cannot be undone."):
+                            try:
+                                db.delete_task(int(t["id"]))
+                                toast_success("Task deleted.")
+                                st.experimental_rerun()
+                            except Exception as ex:
+                                st.error(f"Failed to delete: {ex}")
 
 
 def page_pomodoro() -> None:
@@ -670,24 +719,77 @@ def page_settings(settings: Settings) -> None:
     st.write("Configure your app preferences.")
 
     st.text_input("Database Path", value=db.get_db_path(), disabled=True, help="Using local SQLite database.")
-    st.toggle("Notifications Enabled", value=settings.NOTIFICATIONS_ENABLED, disabled=True)
-    st.slider("Scheduler Interval Seconds", 15, 300, settings.SCHEDULER_INTERVAL_SECONDS, disabled=True)
 
-    st.markdown("#### Suggestion Weights (read-only; configure via env)")
+    # Live toggles mirror sidebar
+    s1, s2 = st.columns([1, 2])
+    with s1:
+        notif = st.toggle("Notifications Enabled", value=settings.NOTIFICATIONS_ENABLED, help="OS notifications fallback to in-app toasts.")
+    with s2:
+        interval = st.slider("Scheduler Interval Seconds", 15, 300, settings.SCHEDULER_INTERVAL_SECONDS, step=15)
+
+    if notif != settings.NOTIFICATIONS_ENABLED or interval != settings.SCHEDULER_INTERVAL_SECONDS:
+        settings.NOTIFICATIONS_ENABLED = bool(notif)
+        settings.SCHEDULER_INTERVAL_SECONDS = int(interval)
+        try:
+            sched.update_scheduler_config(
+                interval_seconds=settings.SCHEDULER_INTERVAL_SECONDS,
+                notifications_enabled=settings.NOTIFICATIONS_ENABLED,
+            )
+            toast_success("Scheduler settings updated.")
+        except Exception as ex:
+            st.warning(f"Failed to update scheduler config: {ex}")
+
+    st.markdown("#### Suggestion Weights")
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        st.number_input("Weight: Priority", value=float(settings.SUGGESTION_WEIGHT_PRIORITY), disabled=True)
+        w_priority = st.number_input("Weight: Priority", value=float(settings.SUGGESTION_WEIGHT_PRIORITY), min_value=0.0, step=0.1)
     with c2:
-        st.number_input("Weight: Urgency", value=float(settings.SUGGESTION_WEIGHT_URGENCY), disabled=True)
+        w_urgency = st.number_input("Weight: Urgency", value=float(settings.SUGGESTION_WEIGHT_URGENCY), min_value=0.0, step=0.1)
     with c3:
-        st.number_input("Weight: Overdue", value=float(settings.SUGGESTION_WEIGHT_OVERDUE_BOOST), disabled=True)
+        w_overdue = st.number_input("Weight: Overdue", value=float(settings.SUGGESTION_WEIGHT_OVERDUE_BOOST), min_value=0.0, step=0.1)
     with c4:
-        st.number_input("Weight: Short-task", value=float(settings.SUGGESTION_WEIGHT_SHORT_TASK_BIAS), disabled=True)
+        w_short = st.number_input("Weight: Short-task", value=float(settings.SUGGESTION_WEIGHT_SHORT_TASK_BIAS), min_value=0.0, step=0.1)
     c5, c6 = st.columns(2)
     with c5:
-        st.number_input("Short-task threshold (min)", value=int(settings.SUGGESTION_SHORT_TASK_THRESHOLD_MIN), disabled=True)
+        short_thr = st.number_input("Short-task threshold (min)", value=int(settings.SUGGESTION_SHORT_TASK_THRESHOLD_MIN), min_value=1, step=1)
     with c6:
-        st.number_input("Urgency window (hours)", value=int(settings.SUGGESTION_URGENCY_WINDOW_HOURS), disabled=True)
+        urg_win = st.number_input("Urgency window (hours)", value=int(settings.SUGGESTION_URGENCY_WINDOW_HOURS), min_value=1, step=1)
+
+    if (
+        w_priority != settings.SUGGESTION_WEIGHT_PRIORITY
+        or w_urgency != settings.SUGGESTION_WEIGHT_URGENCY
+        or w_overdue != settings.SUGGESTION_WEIGHT_OVERDUE_BOOST
+        or w_short != settings.SUGGESTION_WEIGHT_SHORT_TASK_BIAS
+        or short_thr != settings.SUGGESTION_SHORT_TASK_THRESHOLD_MIN
+        or urg_win != settings.SUGGESTION_URGENCY_WINDOW_HOURS
+    ):
+        settings.SUGGESTION_WEIGHT_PRIORITY = float(w_priority)
+        settings.SUGGESTION_WEIGHT_URGENCY = float(w_urgency)
+        settings.SUGGESTION_WEIGHT_OVERDUE_BOOST = float(w_overdue)
+        settings.SUGGESTION_WEIGHT_SHORT_TASK_BIAS = float(w_short)
+        settings.SUGGESTION_SHORT_TASK_THRESHOLD_MIN = int(short_thr)
+        settings.SUGGESTION_URGENCY_WINDOW_HOURS = int(urg_win)
+        toast_info("Suggestion weights updated for this session. To persist across restarts, set env vars (see .env.example).")
+
+    st.markdown("#### Pomodoro Defaults")
+    from . import pomodoro as pomo  # local import to avoid overhead at module import
+
+    cfg, _ = pomo.get_config_and_state()
+    p1, p2, p3, p4 = st.columns(4)
+    with p1:
+        pf = st.number_input("Focus (min)", min_value=1, max_value=180, value=int(cfg.focus_minutes), step=1)
+    with p2:
+        ps = st.number_input("Short Break (min)", min_value=1, max_value=60, value=int(cfg.short_break_minutes), step=1)
+    with p3:
+        pl = st.number_input("Long Break (min)", min_value=1, max_value=120, value=int(cfg.long_break_minutes), step=1)
+    with p4:
+        pi = st.number_input("Long Break Interval", min_value=1, max_value=12, value=int(cfg.long_break_interval), step=1)
+    if st.button("Apply Pomodoro Defaults", key="apply_pomo_defaults"):
+        try:
+            pomo.apply_config(int(pf), int(ps), int(pl), int(pi))
+            toast_success("Pomodoro configuration updated.")
+        except Exception as ex:
+            st.error(f"Failed to update Pomodoro defaults: {ex}")
 
     st.caption("Environment variables can override defaults. See .env.example.")
 
