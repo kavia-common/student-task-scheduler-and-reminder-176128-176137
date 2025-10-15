@@ -1,10 +1,21 @@
 import streamlit as st
-from datetime import datetime
+from datetime import datetime, date
+from typing import Optional
+
+import altair as alt
+import plotly.express as px
 
 from . import db
 from . import scheduler as sched
 from .settings import get_settings, Settings
 from .utils import ocean_styles, toast_info, toast_success, toast_warning, format_ts
+from .dashboards import (
+    DashboardFilters,
+    get_kpis,
+    completion_trend_dataframe,
+    tasks_by_category_dataframe,
+    priority_distribution_dataframe,
+)
 
 
 # PUBLIC_INTERFACE
@@ -90,17 +101,119 @@ def render_sidebar(settings: Settings) -> None:
 
 def page_dashboard() -> None:
     st.markdown("### 📊 Dashboard")
-    st.write("Welcome! Your upcoming reminders and stats will appear here.")
-    # Placeholder summary cards
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("Open Tasks", db.count_open_tasks())
-    with col2:
-        st.metric("Due Today", db.count_due_today())
-    with col3:
-        st.metric("Pomodoro Sessions", db.count_pomodoro_today())
 
-    st.info("This is a minimal vertical slice. More insights coming soon.")
+    # Filters row
+    with st.container():
+        cf1, cf2, cf3, cf4 = st.columns([1.2, 1.2, 1.2, 1.2])
+        with cf1:
+            # Date range
+            dr = st.date_input("Date range (due date)", [], help="Filter analytics by due date range.")
+            start_d: Optional[date] = None
+            end_d: Optional[date] = None
+            if isinstance(dr, list) and len(dr) == 2 and (dr[0] or dr[1]):
+                start_d = dr[0] or None
+                end_d = dr[1] or None
+        with cf2:
+            categories = ["any"] + db.list_categories()
+            sel_cat = st.selectbox("Category", options=categories, index=0)
+        with cf3:
+            sel_status = st.selectbox("Status", options=["any","open","in_progress","done","canceled"], index=0)
+        with cf4:
+            st.caption("Use filters to refine KPIs and charts.")
+
+    filters = DashboardFilters(
+        start_date=start_d,
+        end_date=end_d,
+        category=sel_cat,
+        status=sel_status,
+    )
+
+    # KPI row
+    kpis = get_kpis(filters)
+    k1, k2, k3, k4, k5 = st.columns(5)
+    with k1:
+        st.metric("Total Tasks", kpis.get("total", 0))
+    with k2:
+        st.metric("Pending", kpis.get("pending", 0))
+    with k3:
+        st.metric("Completed Today", kpis.get("completed_today", 0))
+    with k4:
+        st.metric("This Week", kpis.get("completed_this_week", 0))
+    with k5:
+        st.metric("Overdue", kpis.get("overdue", 0))
+
+    # Secondary quick stats
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("Open Tasks (all)", db.count_open_tasks())
+    with c2:
+        st.metric("Due Today (all)", db.count_due_today())
+    with c3:
+        st.metric("Pomodoro Sessions Today", db.count_pomodoro_today())
+
+    st.markdown("---")
+
+    # Charts
+    ch1, ch2 = st.columns([2, 1.5])
+
+    # Completion trend (Altair line/area chart)
+    with ch1:
+        st.subheader("Completion Trend")
+        df_trend = completion_trend_dataframe(filters)
+        if df_trend.empty:
+            st.info("No completion data for the selected filters/date range.")
+        else:
+            chart = (
+                alt.Chart(df_trend)
+                .mark_area(line={"color": "#2563EB"}, color="lightblue", opacity=0.5)
+                .encode(
+                    x=alt.X("day:T", title="Day"),
+                    y=alt.Y("completed_count:Q", title="Completed Tasks"),
+                    tooltip=[alt.Tooltip("day:T", title="Day"), alt.Tooltip("completed_count:Q", title="Completed")],
+                )
+                .properties(height=300)
+            )
+            st.altair_chart(chart, use_container_width=True)
+
+    # Tasks by category (Altair bar)
+    with ch2:
+        st.subheader("Tasks by Category")
+        df_cat = tasks_by_category_dataframe(filters)
+        if df_cat.empty:
+            st.info("No tasks found for the selected filters.")
+        else:
+            chart2 = (
+                alt.Chart(df_cat)
+                .mark_bar(color="#2563EB")
+                .encode(
+                    x=alt.X("cnt:Q", title="Count"),
+                    y=alt.Y("category:N", sort="-x", title="Category"),
+                    tooltip=[alt.Tooltip("category:N", title="Category"), alt.Tooltip("cnt:Q", title="Tasks")],
+                )
+                .properties(height=300)
+            )
+            st.altair_chart(chart2, use_container_width=True)
+
+    # Priority distribution (Plotly pie)
+    st.subheader("Priority Distribution")
+    df_pri = priority_distribution_dataframe(filters)
+    if df_pri.empty:
+        st.info("No tasks to show priority distribution for the selected filters.")
+    else:
+        # Map priority numbers to labels
+        def pri_label(n: int) -> str:
+            try:
+                i = int(n)
+            except Exception:
+                return "Unknown"
+            return {3: "High", 2: "Medium", 1: "Low"}.get(i, f"P{i}")
+
+        df_pri = df_pri.copy()
+        df_pri["priority_label"] = df_pri["priority"].apply(pri_label)
+        fig = px.pie(df_pri, values="cnt", names="priority_label", color="priority_label",
+                     color_discrete_map={"High": "#EF4444", "Medium": "#F59E0B", "Low": "#10B981"})
+        fig.update_traces(textposition="inside", textinfo="percent+label")
+        st.plotly_chart(fig, use_container_width=True)
 
 
 def page_tasks() -> None:
